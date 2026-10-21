@@ -18,6 +18,7 @@ const validCardId = id => {
 }
 // Not `||`, which turns max_hours 0 into 12. A value that is not a number falls back to 12.
 const MAX_HOURS = typeof A.max_hours === 'number' && A.max_hours >= 0 ? A.max_hours : 12
+const WAKE = 270 // below the 5-minute cache TTL
 const LIVE = 'python3 "${KANBAN_LANES_HOME:-$HOME/.claude/kanban-lanes}/scripts/kanban_live.py"'
 const QUEUED = ['triage', 'todo', 'ready', 'scheduled']
 const TERMINAL = ['done', 'blocked', 'archived', 'review']
@@ -45,20 +46,21 @@ const CARD = {
 const CARDS = {
   type: 'object',
   properties: {
-    now: { type: 'integer' }, cards: { type: 'array', items: CARD },
+    now: { type: 'integer' }, cards: { type: 'array', items: CARD }, count: { type: 'integer' },
     missing: { type: 'array', items: { type: 'string' } },
   },
-  required: ['now', 'cards'],
+  required: ['now', 'cards', 'count'],
 }
 const EVENTS = {
   type: 'object',
   properties: {
     changed: { type: 'array', items: CARD, description: 'cards that started' },
     new: { type: 'array', items: CARD, description: 'cards a watched card filed' },
+    count_new: { type: 'integer' },
     all_finished: { type: 'boolean' },
     timeout: { type: 'boolean' },
   },
-  required: ['changed', 'new'],
+  required: ['changed', 'new', 'count_new'],
 }
 const REPORT = {
   type: 'object',
@@ -125,8 +127,8 @@ const watchCard = async c => {
     // A visible row while the card waits, so "not started" cards are named, not just implied.
     const waited = await agent(
       `${READ_ONLY}\n\nKanban card ${c.id} ("${short(c.title, 120)}") on board ${BOARD} has not started yet. Run` +
-      ` \`${LIVE} wait-start --board ${shellQuote(BOARD)} --task ${shellQuote(c.id)} --max-seconds 570\`. Exit 3 means it is still waiting: run the same command again,` +
-      ` up to 80 times (a card can wait hours for its parents or a free worker). Stop on exit 0 (it started) or 4/5.` +
+      ` \`${LIVE} wait-start --board ${shellQuote(BOARD)} --task ${shellQuote(c.id)} --max-seconds ${WAKE}\`. Exit 3 means it is still waiting: run the same command again,` +
+      ` up to 169 times (a card can wait hours for its parents or a free worker). Stop on exit 0 (it started) or 4/5.` +
       ` Return the last status it printed and the model named on that line.`,
       {
         agentType: 'kanban-watcher', model: 'haiku', effort: 'low',
@@ -146,11 +148,11 @@ const watchCard = async c => {
   const report = await agent(
     `${READ_ONLY}\n\nYou are the live view of Kanban card ${c.id} ("${short(c.title, 120)}") on board ${BOARD}${who ? `, worked by ${who}` : ''}.` +
     ` The person who filed it opens you to watch its worker: each command prints what the worker says and every tool it calls, as it happens.\n` +
-    `1. Run \`${LIVE} follow --board ${shellQuote(BOARD)} --task ${shellQuote(c.id)} --cursor-key wf --from-start --backlog 15 ${shellQuote(FOLLOW_MODE)} --quiet-warn 480 --max-seconds 540\`.\n` +
-    `2. Exit 3 means the card is still working: run \`${LIVE} follow --board ${shellQuote(BOARD)} --task ${shellQuote(c.id)} --cursor-key wf ${shellQuote(FOLLOW_MODE)} --quiet-warn 480 --max-seconds 540\` again,` +
-    ` and keep going until it exits 0. A card can run for hours; that is expected, so keep calling (up to 150 times). Reply with nothing between calls; just run the command again.\n` +
-    `3. On exit 0 (a line starting FINAL) or 4/5, run \`${LIVE} snapshot --board ${shellQuote(BOARD)} --task ${shellQuote(c.id)}\` and report from its JSON:` +
-    ` verdict from status (done=DONE, blocked=BLOCKED, review=REVIEW, archived=ARCHIVED, running or queued after 150 calls=STILL_RUNNING),` +
+    `1. Run \`${LIVE} follow --board ${shellQuote(BOARD)} --task ${shellQuote(c.id)} --cursor-key ${shellQuote(`run${first.now}`)} --from-start --backlog 15 ${shellQuote(FOLLOW_MODE)} --max-seconds ${WAKE} --quiet-warn 240\`.\n` +
+    `2. Exit 3 means the card is still working: run \`${LIVE} follow --board ${shellQuote(BOARD)} --task ${shellQuote(c.id)} --cursor-key ${shellQuote(`run${first.now}`)} ${shellQuote(FOLLOW_MODE)} --max-seconds ${WAKE} --quiet-warn 240\` again,` +
+    ` and keep going until it exits 0. A card can run for hours; that is expected, so keep calling (up to 300 times). Reply with nothing between calls; just run the command again.\n` +
+    `3. On exit 0 (a line starting FINAL), on 4/5, or after 300 calls, run \`${LIVE} snapshot --board ${shellQuote(BOARD)} --task ${shellQuote(c.id)}\` and report from its JSON:` +
+    ` verdict from status (done=DONE, blocked=BLOCKED, review=REVIEW, archived=ARCHIVED, running or queued after 300 calls=STILL_RUNNING),` +
     ` model_that_ran = run.model_used plus "(fallback from X)" when run.fallback_from is set, duration from run.started_at to run.ended_at,` +
     ` summary = run.summary verbatim.` +
     ` If two follow calls in a row each printed a "no new worker messages" line while the card was running, say "possibly wedged" in odd.`,
@@ -188,11 +190,14 @@ const named = requested.filter(validCardId)
 // Dropping every requested id must not silently expand the watch to the whole board.
 if (requested.length && !named.length) return { board: BOARD, cards: [] }
 const first = await agent(
-  `${READ_ONLY}\n\nRun \`${LIVE} cards --board ${shellQuote(BOARD)}${named.map(t => ` --task ${shellQuote(t)}`).join('')}\` and return its JSON as is (now, cards, missing).`,
+  `${READ_ONLY}\n\nRun \`${LIVE} cards --board ${shellQuote(BOARD)}${named.map(t => ` --task ${shellQuote(t)}`).join('')}\`; run it once and return its JSON as is (now, cards, count, missing).`,
   { agentType: 'kanban-watcher', model: 'haiku', effort: 'low', label: `read board ${BOARD}`, phase: BOARD_PHASE, schema: CARDS },
 )
 if (!first) return { error: 'could not read the board' }
 for (const c of first.cards) if (validCardId(c.id)) cards[c.id] = { ...c, status: normStatus(c.status) }
+if (first.count > Object.keys(cards).length) {
+  log(`board read lost ${first.count - Object.keys(cards).length} cards (ids: ${Object.keys(cards).join(', ')})`)
+}
 if ((first.missing || []).length) log(`not on board ${BOARD}: ${first.missing.join(', ')}`)
 const since = first.now
 
@@ -219,9 +224,9 @@ if (A.follow_new !== false) {
     const watchList = watched.map(c => `${c.id}=${normStatus(c.status)}`).join(',')
     const knownList = Object.keys(cards).join(',')
     const ev = await agent(
-      `${READ_ONLY}\n\nRun \`${LIVE} events --board ${shellQuote(BOARD)} --watch ${shellQuote(watchList)} --known ${shellQuote(knownList)} --since ${shellQuote(since)} --max-seconds 570\`.` +
-      ` Exit 3 means nothing new yet: run the same command again, up to 6 times (about an hour). Stop on exit 0 (a watched card filed a new card),` +
-      ` exit 2 (every watched card finished: all_finished true) or 5. Return the last call's JSON: copy changed and new exactly as printed.`,
+      `${READ_ONLY}\n\nRun \`${LIVE} events --board ${shellQuote(BOARD)} --watch ${shellQuote(watchList)} --known ${shellQuote(knownList)} --since ${shellQuote(since)} --max-seconds ${WAKE}\`.` +
+      ` Exit 3 means nothing new yet: run the same command again, up to 13 times (about an hour). Stop on exit 0 (a watched card filed a new card),` +
+      ` exit 2 (every watched card finished: all_finished true) or 5. Return the last call's JSON: copy changed, new and count_new exactly as printed.`,
       {
         agentType: 'kanban-watcher', model: 'haiku', effort: 'low',
         label: 'watching for cards the workers file', phase: BOARD_PHASE, schema: EVENTS,
@@ -232,11 +237,16 @@ if (A.follow_new !== false) {
       if (!validCardId(c.id)) continue
       if (cards[c.id]) Object.assign(cards[c.id], c, { status: normStatus(c.status) })
     }
+    const keptNew = []
     for (const c of ev.new || []) {
       if (!validCardId(c.id)) continue
       if (cards[c.id]) continue
       cards[c.id] = { ...c, status: normStatus(c.status) }
+      keptNew.push(c.id)
       log(`new card ${c.id} "${short(c.title)}" in ${assignPhase(c)}`)
+    }
+    if (ev.count_new > keptNew.length) {
+      log(`board read lost ${ev.count_new - keptNew.length} cards (ids: ${keptNew.join(', ')})`)
     }
     launchAll()
     if (ev.all_finished) break

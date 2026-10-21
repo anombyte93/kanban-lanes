@@ -101,12 +101,13 @@ Inside your own script, use one `agentType: 'kanban-watcher'` stage (pinned to `
 waits on the exact card ids, as `examples/mixed-wave.js` does:
 
 ```bash
-timeout 590 python3 "${KANBAN_LANES_HOME:-$HOME/.claude/kanban-lanes}/scripts/wave_status.py" \
-  --board default --task <id> --task <id> --wait 540 --interval 60
+timeout 290 python3 "${KANBAN_LANES_HOME:-$HOME/.claude/kanban-lanes}/scripts/wave_status.py" \
+  --board default --task <id> --task <id> --wait 270 --interval 60
 ```
 
-The Bash tool stops a call at 10 minutes, so keep `--wait` under 600 seconds and run the command
-again on exit 3. From the parent session with Bash `run_in_background`, a longer `--wait` is fine.
+Keep an agent's `--wait` at 270 seconds so the next turn can read its prompt cache. Run the
+command again on exit 3. From the parent session with Bash `run_in_background`, a longer
+`--wait` is fine: a background shell process holds no model prompt cache.
 
 - It reads only the cards you name, in one read transaction, and never dispatches, archives,
   resets or comments.

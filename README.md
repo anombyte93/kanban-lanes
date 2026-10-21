@@ -35,8 +35,8 @@ It also ships a routing table that names a model for every workflow stage, and a
     <td>The worker runs on the model your Hermes profile names. Claude only watches. This holds unless your Hermes profile uses the same Claude account, which shares its limits.</td>
   </tr>
   <tr>
-    <td><b>Waiting costs about one model turn every 9 minutes</b></td>
-    <td><code>scripts/kanban_live.py</code> blocks in Python. A waiting or events call lasts up to 570 seconds. A live call lasts up to 540. The row's model runs the same command again when a call times out.</td>
+    <td><b>Waits stay inside the prompt cache window</b></td>
+    <td><code>scripts/kanban_live.py</code> blocks in Python for up to 270 seconds per call. The row's model runs the same command again when a call times out.</td>
   </tr>
   <tr>
     <td><b>Scripts open your board read-only</b></td>
@@ -145,11 +145,16 @@ Each card gets up to three rows:
 
 | Row | When | What you see |
 |---|---|---|
-| `⏳ waiting` | The card is queued | Nothing until a worker claims it. The row blocks in Python for up to 570 seconds per call. |
+| `⏳ waiting` | The card is queued | Nothing until a worker claims it. The row blocks in Python for up to 270 seconds per call. |
 | Live row | The worker is running | The worker's newest tool calls and its latest message, at most 1.5 KB per call. A last line counts what it left out. With `verbose: true` you get every message and tool result. When the card stops, the row ends with the report: verdict, the model that ran plus any fallback, duration and deliverable. |
 | `⚠` row | The card stops as anything but `DONE` | Shown under **Needs you**, with the reason read from `kanban_live.py snapshot`. This covers `BLOCKED`, `REVIEW`, `ARCHIVED` and `STILL_RUNNING`. If no block reason was recorded, the row says so. |
 
 Cards a worker files while it runs join the run under **Filed by &lt;card&gt;**, so a run that grows is still one view.
+
+Each watch uses a run-scoped follow cursor. Graph reads cap titles at 120 characters and return
+counts so the workflow can warn if a model drops cards from its reply. A compact follow call
+prints `no new worker messages` after 240 seconds without progress, even at the byte cap.
+Heartbeats do not count as progress. Two quiet running calls flag the card as possibly wedged.
 
 `scripts/wave_status.py` prints one JSON snapshot of the cards you name (members, counts, `all_done`). With `--wait` it blocks until they are quiescent. Both scripts use only the Python standard library.
 
@@ -162,6 +167,7 @@ Cards a worker files while it runs join the run under **Filed by &lt;card&gt;**,
 | `workflows/kanban-watch.js` | The workflow: board plus card ids or phases in, one row per card out. |
 | `scripts/kanban_live.py` | Waits for a card to start, follows it, and snapshots it at the end. |
 | `scripts/wave_status.py` | A one-shot or blocking status view of a set of cards. |
+| `scripts/watch_cost.py` | Reads workflow transcripts and reports watcher tokens by run, role and model. |
 | `skills/dynamic-workflow/` | The routing table, the linter and the journal harvester. |
 | `examples/mixed-wave.js` | Native subagents and Kanban cards in one workflow run. |
 | `examples/sample-args.json` | A sample args file for `kanban-watch.js`, using the phases form. |
@@ -210,22 +216,53 @@ The first prints one line per agent. The second prints each agent's result as JS
 
 ## What it costs
 
-Measured once, on one board and one machine. Before is the earlier watcher, which printed the full stream; after is this one with its default compact live row.
+You still spend Claude turns while you watch. The important part is the prompt cache, not just
+the number of turns. Watcher subagents wrote only the 5-minute cache in the sampled runs.
+They wrote no 1-hour cache entries. An earlier live row with a 540-second wait rebuilt about
+9k tokens at a cold wake. A longer wait meant fewer turns but let that cache expire.
 
-| | Before | After |
-|---|---|---|
-| Live row output per call, in a 10-minute watch | about 11 KB of worker text | 1.3 KB |
-| Live row context at the end of that watch | 23.5k tokens | 14k tokens |
-| Live row first call, three busy finished workers (502-639 messages each) | 34-48 KB | 1.5 KB (the cap) |
-| Flag row read | 16.9 KB (`hermes kanban show`) | about 1 KB (`kanban_live.py snapshot`), up to about 2.5 KB for a blocked card |
-| Model on idle rows | Sonnet | Haiku |
-| Follow calls per hour, per live row | about 12 (300 s each) | about 7 (540 s each) |
+These are `watch_cost.py` results for that one live row, not estimates or test-fixture totals:
 
-Three rows follow from the code: the cap is 1500 bytes, the idle rows pin Haiku, and the call counts are 3600 / 300 and 3600 / 540. The other figures come from that one run. No command log or raw output was kept, so treat them as one observation. A blocked card's snapshot is larger because it carries up to 2000 characters of `block_reason`.
+| Measurement | Tokens or count |
+|---|---:|
+| Model | `claude-sonnet-5-5` |
+| Agents / turns | 1 / 4 |
+| Input / output tokens | 8 / 923 |
+| Cache read tokens | 35,941 |
+| 5-minute / 1-hour cache write tokens | 16,550 / 0 |
+| Cold wakes | 1 |
+| 5-minute cache tokens written at the cold wake | 9,009 |
+| Weighted input-equivalent tokens | 28,904.60 |
 
-The worker's own model use is billed wherever your Hermes profile points.
+You now wait at most 270 seconds per agent call. That leaves room inside the 5-minute window
+for the next turn to read the cache instead of rebuilding it. It is not a measured savings
+percentage: no matched before-and-after run is claimed here. Model latency or a delayed next
+turn can still miss the cache. Cold wakes in the report mean API calls more than 300 seconds
+apart. That timing is a proxy, not proof of provider cache expiry.
 
-> **A watch still spends Claude turns.** A `⏳ waiting` row runs again every 570 seconds, about 6 Haiku turns an hour per queued card. Each live row wakes about every 540 seconds to print what changed, about 7 Sonnet turns an hour. The watch also looks for cards your workers file, every 570 seconds on Haiku. It looks in rounds of up to about an hour, for at most `max_hours` + 2 rounds (default 12, so 14 rounds and about 13 hours). A round ends early when a worker files a card. Pass `follow_new: false` to turn that off.
+Measure your own watch from your workflow transcripts:
+
+```bash
+python3 scripts/watch_cost.py --root ~/.claude/projects --run <run-id>
+python3 scripts/watch_cost.py --root ~/.claude/projects --since 2026-10-20 --json
+python3 scripts/watch_cost.py --help
+```
+
+Replace `<run-id>` with the directory name from the workflow's transcript path. Repeat `--run`
+to select several runs. With no selection, you read all watcher transcripts under the root.
+`--since` keeps whole agents by file modification time or first timestamp, from midnight UTC.
+It does not filter individual turns. JSON groups results by run, role and exact model ID.
+The script reads transcript files only. It never opens your board DB.
+
+The weighted figure uses the assumptions in `--help`. It is not dollars, and you must not add
+different models' figures as if they shared a price. The script deduplicates assistant message
+IDs and counts the last cumulative usage once. Legacy aggregate-only cache writes count as
+5-minute writes. Corrupt watcher transcripts fail visibly instead of returning partial totals.
+
+Your queued rows and the new-card watch use Haiku. Your live rows use Sonnet. All their waits
+use 270 seconds. The new-card watch runs in rounds with up to 13 waits per round, for at most
+`max_hours` + 2 rounds. A new card ends a round early. Pass `follow_new: false` to turn that
+watch off. Your worker's own model use is billed wherever your Hermes profile points.
 
 ---
 

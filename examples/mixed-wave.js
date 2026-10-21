@@ -166,7 +166,7 @@ const native = pipeline(
 const taskFlags = cards.map((c) => `--task ${c}`).join(' ')
 const watch = cards.length
   ? agent(`Standalone mode. Lane: Kanban, wave 1 of a mixed wave. Board: ${board}. Cards: ${cards.join(', ')}.
-Wait with \`timeout 590 python3 ${SCRIPTS}/wave_status.py --board ${board} ${taskFlags} --wait 540 --interval 60\` (Bash timeout 600000 ms). On exit 3, run the same command again. When it exits 0, run \`timeout 30 python3 ${SCRIPTS}/kanban_live.py snapshot --board ${board} ${taskFlags}\`.
+Wait with \`timeout 290 python3 ${SCRIPTS}/wave_status.py --board ${board} ${taskFlags} --wait 270 --interval 60\` (Bash timeout 600000 ms). On exit 3, run the same command again. When it exits 0, run \`timeout 30 python3 ${SCRIPTS}/kanban_live.py snapshot --board ${board} ${taskFlags}\`.
 Return your report for each card, then the last wave_status.py JSON and the snapshot lines verbatim.`, { label: 'watch:kanban', phase: 'Watch', agentType: 'kanban-watcher' })
   : Promise.resolve(null)
 
