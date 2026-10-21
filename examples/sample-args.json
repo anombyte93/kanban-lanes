@@ -1,0 +1,10 @@
+{
+  "board": "default",
+  "phases": [
+    { "title": "Build", "tasks": ["t_1a2b3c4d", "t_5e6f7a8b"] },
+    { "title": "Verify", "tasks": ["t_9c0d1e2f"] }
+  ],
+  "follow_new": true,
+  "max_hours": 6,
+  "verbose": false
+}

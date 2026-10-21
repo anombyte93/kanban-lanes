@@ -1,0 +1,8 @@
+{"type":"launched"}
+{"type":"started","agentId":"a1","label":"build:x"}
+{"type":"result","agentId":"a1","result":{"commits":["abc1234 feat: x"],"suites":"","done":[],"not_done":[]}}
+{"type":"started","agentId":"a2","label":"review:x"}
+{"type":"result","agentId":"a2","result":{"pass":false,"defects":[{"severity":"medium"},{"severity":"low"}]}}
+{"type":"started","agentId":"a3","label":"fix:x"}
+{"type":"started","agentId":"a4","label":"verify:x"}
+{"type":"result","agentId":"a4","result":{"verdict":"FAIL","head_sha":"deadbeef1234","findings":[{"severity":"high"},{"severity":"low"}]}}

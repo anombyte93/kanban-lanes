@@ -1,0 +1,47 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Python tests
+        run: |
+          if ls tests/*.py >/dev/null 2>&1; then
+            python -m pip install --quiet pytest
+            python -m pytest -q tests/
+          else
+            echo "no Python tests yet"
+          fi
+
+      - name: Linter known-answer tests
+        run: bash tests/test_lint.sh
+
+      - name: Harvester tests
+        run: bash tests/test_status.sh
+
+      - name: shellcheck
+        run: shellcheck install.sh
+
+      - name: install.sh finds every file it installs
+        run: |
+          out="$(HOME="$(mktemp -d)" ./install.sh --dry-run 2>&1)"
+          printf '%s\n' "$out"
+          if printf '%s\n' "$out" | grep -q 'not in this checkout'; then
+            echo "install.sh skipped a file this commit does not have" >&2
+            exit 1
+          fi
