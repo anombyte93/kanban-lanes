@@ -35,7 +35,7 @@ It also ships a routing table that names a model for every workflow stage, and a
     <td>The worker runs on the model your Hermes profile names. Claude only watches. This holds unless your Hermes profile uses the same Claude account, which shares its limits.</td>
   </tr>
   <tr>
-    <td><b>Waits stay inside the prompt cache window</b></td>
+    <td><b>Each wait is shorter than the prompt cache window</b></td>
     <td><code>scripts/kanban_live.py</code> blocks in Python for up to 270 seconds per call. The row's model runs the same command again when a call times out.</td>
   </tr>
   <tr>
@@ -217,11 +217,14 @@ The first prints one line per agent. The second prints each agent's result as JS
 ## What it costs
 
 You still spend Claude turns while you watch. The important part is the prompt cache, not just
-the number of turns. Watcher subagents wrote only the 5-minute cache in the sampled runs.
-They wrote no 1-hour cache entries. An earlier live row with a 540-second wait rebuilt about
-9k tokens at a cold wake. A longer wait meant fewer turns but let that cache expire.
+the number of turns. In the runs measured for this README, watcher subagents wrote only the
+5-minute cache. They wrote no 1-hour cache entries. One live row from the earlier 540-second
+version had one cold wake. That wake rewrote 9,009 tokens. A longer wait meant fewer turns but
+let that cache expire.
 
-These are `watch_cost.py` results for that one live row, not estimates or test-fixture totals:
+This table is `watch_cost.py` output for that one live row, measured once on one machine. It is
+not an estimate. Its transcript is private and not in this repo, so you cannot rerun these
+totals. The test fixture `cold-wake.jsonl` keeps the 9,009-token wake:
 
 | Measurement | Tokens or count |
 |---|---:|

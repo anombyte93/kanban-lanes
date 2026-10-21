@@ -66,7 +66,8 @@ def test_exact_totals_per_role_and_model(tmp_path):
 
 
 def test_text_has_one_row_per_run_and_model_never_summed_across_models(tmp_path):
-    # WEIGHTED is per-model input equivalents with no cross-model price factor.
+    # WEIGHTED is per-model input equivalents with no cross-model price factor,
+    # so Haiku and Sonnet figures must never be added into one number.
     fixture_root(tmp_path)
     proc = invoke(tmp_path)
     assert proc.returncode == 0, proc.stderr
@@ -156,7 +157,8 @@ def test_all_roles_use_first_command_not_later_mentions(tmp_path, role):
 
 @pytest.mark.parametrize("gap,cold", [(300, 0), (301, 1)])
 def test_cold_wake_is_measured_from_previous_api_call_not_tool_result(tmp_path, gap, cold):
-    # The previous API call is at 00:00:01; a tool result must not reset its clock.
+    # The previous assistant turn (the API call) is at T = 00:00:01. A tool_result
+    # arrives at T+299, seconds before the next call, and must not reset the clock.
     run = fixture_root(tmp_path)
     path = run / "agent-cards.jsonl"
     append_row(path, {"type": "user", "timestamp": "2026-10-20T00:05:00Z",
@@ -290,7 +292,7 @@ def test_card_title_role_word_before_command_does_not_pick_the_role(tmp_path):
 def test_card_title_naming_the_script_does_not_pick_the_role(tmp_path):
     run = run_root(tmp_path, "run_title_script", "titled")
     path = run / "agent-titled.jsonl"
-    path.write_text(path.read_text().replace('(\\"rehome needs, fixes\\")',
+    path.write_text(path.read_text().replace('(\\"rehome scout, fixes\\")',
                                           '(\\"map kanban_live.py subcommands\\")'))
     assert "map kanban_live.py subcommands" in path.read_text()
     proc = invoke(tmp_path, "--json")
@@ -318,7 +320,8 @@ def test_reviewer_that_mentions_script_and_role_word_is_not_a_watcher(tmp_path):
 
 
 def test_meta_agent_type_is_the_primary_selector(tmp_path):
-    # A build worker's metadata excludes it even when its prompt runs the script.
+    # reviewer-cmd runs kanban_live.py in command form but its meta says it is a
+    # build worker; meta-watcher never names the script but meta says kanban-watcher.
     run = run_root(tmp_path, "run_meta", "reviewer-cmd", "meta-watcher")
     proc = invoke(tmp_path, "--json")
     assert proc.returncode == 0, proc.stderr
@@ -329,6 +332,8 @@ def test_meta_agent_type_is_the_primary_selector(tmp_path):
 
 
 def test_corrupt_non_watcher_transcript_does_not_fail_the_report(tmp_path):
+    # No user row, then a truncated line: classified as not-a-watcher at its first
+    # reply, so the corrupt tail is never parsed.
     run_root(tmp_path, "run_corrupt", "cards", "corrupt-other")
     proc = invoke(tmp_path, "--json")
     assert proc.returncode == 0, proc.stderr
