@@ -38,8 +38,8 @@ the steps below. The workflow also sets your model per row: `haiku` on the waiti
 events and flag rows, and `sonnet` on the live row. This file's `sonnet` is the default for any
 other caller.
 
-- Run each one in the foreground with a Bash timeout of 600000 ms. `wait-start` and `events`
-  block for up to 570 seconds a call, `follow` for up to 540.
+- Run each one in the foreground with a Bash timeout of 600000 ms. `wait-start`, `events` and
+  `follow` block for up to 270 seconds a call, inside the 5-minute prompt cache window.
 - `follow` prints the card worker's own tool calls and latest message as they land, so your
   transcript becomes the live view of that worker. By default it runs `--compact`: the newest tool
   calls and the latest message, at most 1500 bytes a call, with a last line counting what it left
@@ -54,13 +54,13 @@ other caller.
 1. **Wait.** This blocks until every card is done, blocked, in review or archived:
 
    ```bash
-   timeout 590 python3 "$S/wave_status.py" --board <board> --task <id> [--task <id> ...] \
-     --wait 540 --interval 60 --stop-on-blocked
+   timeout 290 python3 "$S/wave_status.py" --board <board> --task <id> [--task <id> ...] \
+     --wait 270 --interval 60 --stop-on-blocked
    ```
 
    Run it in the foreground with a Bash timeout of 600000 ms (the Bash tool's 10-minute cap). The
-   wait of 540 seconds stays under that cap, so each call ends on its own: exit 0 when the cards
-   are quiescent, exit 3 when the 540 seconds run out, with the last snapshot printed either way.
+   wait of 270 seconds stays inside the prompt cache window, so each call ends on its own: exit 0
+   when the cards are quiescent, exit 3 when the time runs out, with the last snapshot printed either way.
    On exit 3, run the same command again; it re-reads the same cards. Never write your own polling
    loop. Reply with nothing between calls.
 

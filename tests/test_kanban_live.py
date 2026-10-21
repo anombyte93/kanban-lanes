@@ -6,8 +6,11 @@ databases under a fake HERMES_HOME; no agent processes. The workflow tests run
 workflows/kanban-watch.js under node with inert agents.
 """
 import json
+import argparse
+import io
 import os
 import re
+import runpy
 import shlex
 import shutil
 import sqlite3
@@ -16,6 +19,7 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -478,7 +482,17 @@ class KanbanLiveContract:
         out = self.run_live("follow", "--board", "b1", "--task", "t_run", "--compact",
                             "--quiet-warn", "1", "--max-seconds", "3", "--interval", "1")
         self.assertEqual(out.returncode, 3, out.stderr)
-        self.assertIn("no new worker messages for", out.stdout)
+        self.assertIn("no new worker messages\n", out.stdout)
+
+    def test_compact_quiet_signal_survives_a_full_or_minimum_byte_cap(self):
+        for cap in (128, 1500):
+            out = self.run_live("follow", "--board", "b1", "--task", "t_run", "--compact",
+                                "--quiet-warn", "0", "--max-seconds", "1", "--interval", "1",
+                                "--from-start", "--max-bytes", str(cap))
+            self.assertEqual(out.returncode, 3, out.stderr)
+            self.assertIn("no new worker messages\n", out.stdout)
+            self.assertIn("still running", out.stdout)
+            self.assertLessEqual(len(out.stdout.encode()), cap)
 
     # scout
 
@@ -514,11 +528,25 @@ class KanbanLiveContract:
         self.assertEqual(by_id["t_wait"]["creator"], "t_run")
         self.assertEqual(by_id["t_run"]["model"], "model-large" if self.FLAVOUR == "fork" else "")
         self.assertEqual(data["missing"], ["t_ghost"])
+        self.assertEqual(data["count"], 2)
 
     def test_cards_without_task_lists_live_cards(self):
         out = self.run_live("cards", "--board", "b1")
         self.assertEqual(out.returncode, 0, out.stderr)
         self.assertEqual({c["id"] for c in json.loads(out.stdout)["cards"]}, {"t_run", "t_wait"})
+
+    def test_graph_titles_are_capped_without_truncating_snapshot_titles(self):
+        title = "界" * 200
+        with sqlite3.connect(self.board_db) as con:
+            con.execute("update tasks set title = ? where id = 't_wait'", (title,))
+        cards = json.loads(self.run_live("cards", "--board", "b1", "--task", "t_wait").stdout)
+        self.assertEqual(cards["cards"][0]["title"], title[:120])
+        events = json.loads(self.run_live("events", "--board", "b1", "--watch", "t_run=running",
+                                          "--since", "0", "--max-seconds", "0").stdout)
+        self.assertEqual(events["new"][0]["title"], title[:120])
+        self.assertEqual(events["count_new"], len(events["new"]))
+        snapshot = json.loads(self.run_live("snapshot", "--board", "b1", "--task", "t_wait").stdout)
+        self.assertEqual(snapshot["title"], title)
 
     # events
 
@@ -533,6 +561,7 @@ class KanbanLiveContract:
         self.assertEqual(started.returncode, 3)
         data = json.loads(started.stdout)
         self.assertTrue(data["timeout"])
+        self.assertEqual(data["count_new"], 0)
         self.assertEqual([c["id"] for c in data["changed"]], ["t_run"])
 
     def test_events_never_report_a_known_card_as_new(self):
@@ -552,6 +581,7 @@ class KanbanLiveContract:
                             str(int(time.time()) + 10), "--max-seconds", "1")
         self.assertEqual(out.returncode, 2)
         self.assertTrue(json.loads(out.stdout)["all_finished"])
+        self.assertEqual(json.loads(out.stdout)["count_new"], 0)
 
     # where the board lives
 
@@ -626,7 +656,8 @@ const agent = async (prompt, options) => {
   const req = options.schema.required;
   if (req.includes('now')) {
     if (cfg.live) { const r = runLive(prompt); call.exit = r.code; return r.data; }
-    return {now: cfg.now === undefined ? 1 : cfg.now, cards: cfg.initial};
+    return {now: cfg.now === undefined ? 1 : cfg.now, cards: cfg.initial,
+            count: cfg.count === undefined ? cfg.initial.length : cfg.count};
   }
   if (req.includes('changed')) {
     await new Promise(r => setTimeout(r, 5));
@@ -746,10 +777,12 @@ new AsyncFunction('args', 'agent', 'log', source)(cfg.args || {}, agent, message
                     self.assertNotIn("hermes kanban", prompt)
                     if live:
                         self.assertIn("--verbose" if verbose else "--compact", prompt)
-                        self.assertIn("--max-seconds 540", prompt)
+                        self.assertIn("--max-seconds 270", prompt)
+                        self.assertIn("up to 300 times", prompt)
                         self.assertIn("Reply with nothing between calls; just run the command again.", prompt)
                     elif " wait-start " in prompt or " events " in prompt:
-                        self.assertIn("--max-seconds 570", prompt)
+                        self.assertIn("--max-seconds 270", prompt)
+                        self.assertIn("up to 169 times" if " wait-start " in prompt else "up to 13 times", prompt)
                     if call["schema"]["required"] == ["reason"]:
                         self.assertIn(" snapshot ", prompt)
                         self.assertIn("block_reason", prompt)
@@ -807,11 +840,31 @@ new AsyncFunction('args', 'agent', 'log', source)(cfg.args || {}, agent, message
         self.assertTrue(any(" follow --board " in c["prompt"] and "t_wait" in c["prompt"] for c in calls))
 
     def test_workflow_follow_asks_for_a_quiet_line_inside_one_call(self):
-        # The wedge hint needs the quiet line to fire within one 540-second follow call.
+        # The wedge hint needs the quiet line to fire within one 270-second follow call.
         follows = [c for c in self.workflow_calls() if " follow --board " in c["prompt"]]
         self.assertTrue(follows)
         for call in follows:
-            self.assertEqual(call["prompt"].count("--quiet-warn 480 --max-seconds 540"), 2)
+            self.assertEqual(call["prompt"].count("--max-seconds 270 --quiet-warn 240"), 2)
+
+    def test_workflow_cursor_is_run_scoped_and_shared_only_within_that_run(self):
+        keys = []
+        for now in (100, 101):
+            calls = self.run_workflow(now=now)
+            run_keys = set()
+            for call in calls:
+                for command in re.findall(r"`([^`]*kanban_live\.py[^`]*)`", call["prompt"]):
+                    argv = shlex.split(command)
+                    if "--cursor-key" in argv:
+                        run_keys.add(argv[argv.index("--cursor-key") + 1])
+            self.assertEqual(len(run_keys), 1)
+            keys.append(run_keys.pop())
+        self.assertNotEqual(*keys)
+
+    def test_workflow_logs_card_count_losses(self):
+        data = self.run_workflow(captureLogs=True, count=4,
+                                 events=[{"changed": [], "new": [], "count_new": 2, "all_finished": True}])
+        self.assertTrue(any("board read lost 1 cards" in line for line in data["logs"]))
+        self.assertTrue(any("board read lost 2 cards" in line for line in data["logs"]))
 
     def test_workflow_keeps_max_hours_zero(self):
         rounds = [{"changed": [], "new": [], "timeout": True}] * 20
@@ -901,6 +954,42 @@ class UpstreamSchemaTests(KanbanLiveContract, unittest.TestCase):
 
 class ForkSchemaTests(KanbanLiveContract, unittest.TestCase):
     FLAVOUR = "fork"
+
+
+class QuietProgressTests(unittest.TestCase):
+    def test_all_agent_wait_examples_wake_inside_the_cache_window(self):
+        for path in (ROOT / "examples" / "mixed-wave.js", ROOT / "agents" / "kanban-watcher.md",
+                     ROOT / "docs" / "mixed-waves.md"):
+            waits = re.findall(r"--wait (\d+)", path.read_text())
+            self.assertTrue(waits, path)
+            self.assertEqual(set(waits), {"270"}, path)
+
+    def test_heartbeat_only_calls_do_not_hide_a_wedged_worker(self):
+        module = runpy.run_path(str(SCRIPT))
+        follow = module["cmd_follow"]
+        clock = [1000.0]
+        card = {"id": "t_run", "title": "Working", "status": "running", "assignee": "worker"}
+        calls = json.dumps([{"function": {"name": "functions.kanban_heartbeat"}}])
+        rows = [{"id": 1, "role": "assistant", "content": "", "tool_calls": calls,
+                 "tool_name": None, "timestamp": 1000},
+                {"id": 2, "role": "tool", "content": "ok", "tool_calls": None,
+                 "tool_name": "kanban_heartbeat", "timestamp": 1000}]
+        def nap(deadline, interval):
+            clock[0] = min(deadline, clock[0] + interval)
+        with tempfile.TemporaryDirectory() as tmp:
+            args = argparse.Namespace(board="b", task="t_run", max_seconds=270, interval=15,
+                                      max_bytes=128, compact=True, cursor_key="run1", from_start=False,
+                                      backlog=15, quiet_warn=240)
+            output = io.StringIO()
+            with patch.dict(follow.__globals__, read_card=lambda *a: card,
+                            session_store=lambda *a: Path(tmp), find_session=lambda *a: "s",
+                            compression_child=lambda *a: None, new_messages=lambda *a: rows,
+                            cursor_path=lambda *a: Path(tmp) / "test.cursor", nap=nap), \
+                    patch("time.time", side_effect=lambda: clock[0]), patch("sys.stdout", output):
+                self.assertEqual(follow(args), 3)
+            self.assertIn("no new worker messages\n", output.getvalue())
+            self.assertIn("still running", output.getvalue())
+            self.assertLessEqual(len(output.getvalue().encode()), 128)
 
 
 class MinimalBoardTests(unittest.TestCase):

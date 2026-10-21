@@ -219,6 +219,27 @@ def hhmm(epoch: float | None) -> str:
     return time.strftime("%H:%M:%S", time.localtime(epoch)) if epoch else "-"
 
 
+def is_heartbeat(name: str | None) -> bool:
+    return (name or "").rsplit(".", 1)[-1] == "kanban_heartbeat"
+
+
+def tool_names(row: sqlite3.Row) -> list[str]:
+    try:
+        calls = json.loads(row["tool_calls"] or "[]") or []
+    except (ValueError, TypeError):
+        return ["?"]
+    return [str((call.get("function", call) if isinstance(call, dict) else {}).get("name", "?")) for call in calls]
+
+
+def is_progress(row: sqlite3.Row) -> bool:
+    """Assistant text, a tool call or a tool result that is not just the heartbeat."""
+    if row["role"] == "assistant":
+        return bool((row["content"] or "").strip()) or any(not is_heartbeat(n) for n in tool_names(row))
+    if row["role"] == "tool":
+        return not is_heartbeat(row["tool_name"])
+    return False
+
+
 def card_line(card: dict) -> str:
     run = card.get("run") or {}
     model = run.get("model_used") or "?"
@@ -387,6 +408,7 @@ class FollowOutput:
         self.assistants = 0
         self.latest = None
         self.calls: list[str] = []
+        self.quiet = False
 
     @staticmethod
     def size(line: str) -> int:
@@ -420,7 +442,7 @@ class FollowOutput:
                 self.latest = f"[{hhmm(row['timestamp'])}] agent: {text[:300]}"
             for call in json.loads(row["tool_calls"] or "[]"):
                 fn = call.get("function", call)
-                if fn.get("name", "").rsplit(".", 1)[-1] == "kanban_heartbeat":
+                if is_heartbeat(fn.get("name")):
                     continue
                 args = str(fn.get("arguments", "")).replace("\n", " ")[:80]
                 self.hold(f"→ {fn.get('name', '?')} {args}")
@@ -458,6 +480,10 @@ class FollowOutput:
 
     def finish(self, status: str):
         self.flush_compact()
+        # The quiet warning is a control signal, not droppable worker output.
+        # Put its short line in the reserved status budget even with a tiny cap.
+        if self.quiet:
+            status = "no new worker messages\n" + status
         if self.max_bytes is None:
             print(status, flush=True)
             return
@@ -525,6 +551,7 @@ def cmd_snapshot(args) -> int:
 
 def graph_card(conn: sqlite3.Connection, row: sqlite3.Row) -> dict:
     card = {k: row[k] for k in ("id", "title", "status", "assignee")}
+    card["title"] = card["title"][:120]
     card["parents"] = [r[0] for r in conn.execute(
         "select parent_id from task_links where child_id = ? order by parent_id", (row["id"],))
     ] if table_columns(conn, "task_links") else []
@@ -564,7 +591,7 @@ def cmd_cards(args) -> int:
     cards = board_cards(args.board, args.task)
     found = {c["id"] for c in cards}
     missing = [t for t in (args.task or []) if t not in found]
-    print(json.dumps({"now": int(time.time()), "cards": cards, "missing": missing}))
+    print(json.dumps({"now": int(time.time()), "cards": cards, "count": len(cards), "missing": missing}))
     return 4 if missing else 0
 
 
@@ -590,13 +617,13 @@ def cmd_events(args) -> int:
         changed = [c for c in current if watch.get(c["id"]) in QUEUED and c["status"] not in QUEUED]
         new = [c for c in fresh if c["creator"] in watch or set(c["parents"]) & set(watch)]
         if new:
-            print(json.dumps({"now": int(time.time()), "changed": changed, "new": new}))
+            print(json.dumps({"now": int(time.time()), "changed": changed, "new": new, "count_new": len(new)}))
             return 0
         if current and all(c["status"] in TERMINAL for c in current):
-            print(json.dumps({"now": int(time.time()), "changed": changed, "new": [], "all_finished": True}))
+            print(json.dumps({"now": int(time.time()), "changed": changed, "new": [], "count_new": 0, "all_finished": True}))
             return 2
         if time.time() >= deadline:
-            print(json.dumps({"now": int(time.time()), "changed": changed, "new": [], "timeout": True}))
+            print(json.dumps({"now": int(time.time()), "changed": changed, "new": [], "count_new": 0, "timeout": True}))
             return 3
         nap(deadline, args.interval)
 
@@ -690,7 +717,10 @@ def cmd_follow(args) -> int:
                 after = rows[-1]["id"]
                 if not args.compact:
                     cpath.write_text(str(after))
+            # A heartbeat alone does not prove progress: a wedged worker keeps heartbeating.
+            if any(is_progress(row) for row in rows):
                 quiet_since = time.time()
+                output.quiet = False
             child = compression_child(store, session)
             if child and child not in followed:
                 followed.add(child)
@@ -710,9 +740,11 @@ def cmd_follow(args) -> int:
             if not args.compact:
                 cpath.write_text("0")
         if time.time() - quiet_since > args.quiet_warn:
-            # Compact mode holds it with the tool calls, so the live row sees it too.
-            note(f"[{hhmm(time.time())}] no new worker messages for {int(time.time() - quiet_since)}s"
-                 f" (heartbeat {hhmm(card.get('last_heartbeat_at'))})")
+            if args.compact:
+                output.quiet = True
+            else:
+                output.emit(f"[{hhmm(time.time())}] no new worker messages for {int(time.time() - quiet_since)}s"
+                            f" (heartbeat {hhmm(card.get('last_heartbeat_at'))})")
             quiet_since = time.time()
         if time.time() >= deadline:
             finish(f"[{hhmm(time.time())}] still {card['status']} - call again")
@@ -762,7 +794,7 @@ def main(argv=None) -> int:
         p.add_argument("--board", default="default")
         if many:
             p.add_argument("--task", action="append", required=True)
-        p.add_argument("--max-seconds", type=int, default=540)
+        p.add_argument("--max-seconds", type=int, default=270)
         p.add_argument("--interval", type=int, default=15)
 
     p = sub.add_parser("snapshot")
@@ -784,7 +816,7 @@ def main(argv=None) -> int:
     common(p)
     p.add_argument("--task", required=True)
     p.add_argument("--backlog", type=int, default=15, help="first call: show at most this many earlier messages")
-    p.add_argument("--quiet-warn", type=int, default=600, help="say so after this many seconds with no new message")
+    p.add_argument("--quiet-warn", type=int, default=240, help="say so after this many seconds with no worker progress")
     p.add_argument("--from-start", action="store_true", help="ignore the saved cursor")
     p.add_argument("--cursor-key", default="", help="separate cursor per watcher, so two watchers never share one")
     mode = p.add_mutually_exclusive_group()
