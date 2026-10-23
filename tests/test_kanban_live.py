@@ -644,7 +644,7 @@ const logs = [];
 // would. KANBAN_LANES_HOME points at this checkout, so the prompt's own script path resolves.
 const runLive = prompt => {
   const cmd = prompt.match(/`([^`]*kanban_live\.py[^`]*)`/)[1]
-    .replace(/--max-seconds \d+/g, '--max-seconds 0 --interval 0');
+    .replace(/--max-seconds \d+/g, '--max-seconds 0');
   const out = spawnSync('sh', ['-c', cmd], {encoding: 'utf8', timeout: 5000});
   if (out.error) throw out.error;
   return {cmd, code: out.status, data: JSON.parse(out.stdout || '{}'), stderr: out.stderr};
@@ -666,7 +666,12 @@ const agent = async (prompt, options) => {
     const scripted = (cfg.events || [])[eventsSeen++];
     return scripted || {changed: [], new: [], all_finished: true};
   }
-  if (req.includes('status')) return {status: cfg.waitStatus || 'running'};
+  if (req.includes('started')) {
+    await new Promise(r => setTimeout(r, 1));
+    if (cfg.live) { const r = runLive(prompt); call.exit = r.code; return {...r.data, exit: r.code}; }
+    const ids = [...prompt.matchAll(/--task '(t_\w+)'/g)].map(m => m[1]);
+    return {started: ids, cards: ids.map(id => ({id, title: 'Queued', status: cfg.waitStatus || 'running'})), exit: 0};
+  }
   if (req.includes('reason')) return {reason: 'needs input'};
   const id = prompt.match(/Kanban card (t_\w+)/)[1];
   return {id, verdict: (cfg.verdicts || {})[id] || 'DONE', model_that_ran: 'worker', summary: 'ok'};
@@ -732,7 +737,7 @@ new AsyncFunction('args', 'agent', 'log', source)(cfg.args || {}, agent, message
             events=[{"changed": [{"id": bad, "status": "ready"}],
                      "new": [{"id": bad, "title": "Bad child", "status": "ready"}], "timeout": True}])
         dropped = [line for line in data["logs"] if "invalid card id" in line.lower() and bad in line]
-        self.assertEqual(len(dropped), 6)  # phase, both requested lists, initial, changed, new
+        self.assertEqual(len(dropped), 7)  # phase, requested lists, two board reads, changed, new
         for call in data["calls"]:
             self.assertNotIn(bad, call["prompt"])
         self.assertFalse((self.home / "card-canary").exists())
@@ -864,7 +869,7 @@ new AsyncFunction('args', 'agent', 'log', source)(cfg.args || {}, agent, message
         data = self.run_workflow(captureLogs=True, count=4,
                                  events=[{"changed": [], "new": [], "count_new": 2, "all_finished": True}])
         self.assertTrue(any("board read lost 1 cards" in line for line in data["logs"]))
-        self.assertTrue(any("board read lost 2 cards" in line for line in data["logs"]))
+        self.assertTrue(any("board read lost 2 new" in line for line in data["logs"]))
 
     def test_workflow_keeps_max_hours_zero(self):
         rounds = [{"changed": [], "new": [], "timeout": True}] * 20
@@ -1018,7 +1023,8 @@ class MinimalBoardTests(unittest.TestCase):
         self.assertIsNone(card["current_run_id"])
         cards = json.loads(self.run_live("cards", "--task", "t1").stdout)["cards"]
         self.assertEqual(cards, [{"id": "t1", "title": "Bare card", "status": "done", "assignee": "worker",
-                                  "parents": [], "creator": None, "model": ""}])
+                                  "parents": [], "creator": None, "model": "", "retried": False,
+                                  "runs": 0, "created_at": cards[0]["created_at"]}])
         follow = self.run_live("follow", "--task", "t1", "--max-seconds", "1", "--interval", "1")
         self.assertEqual(follow.returncode, 0, follow.stderr)
         self.assertIn("FINAL t1 [done]", follow.stdout)

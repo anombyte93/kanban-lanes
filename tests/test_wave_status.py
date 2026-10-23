@@ -11,6 +11,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parent.parent
 SCRIPT = ROOT / 'scripts' / 'wave_status.py'
@@ -248,6 +249,20 @@ class CappedContract:
         member = self.members(module.snapshot(self.db, ['cap-a'], now=self.NOW))['cap-a']
         self.assertEqual(member['capped']['label'], 'capped builder 2/2 50m')
         self.assertTrue(member['capped']['alerted'])
+
+    def test_public_cap_label_matches_snapshot_and_is_read_only(self):
+        self.cap('cap-a', 14)
+        self.cap('run-c', 14)
+        self.event('cap-a', 'capped_alerted', {}, 2)
+        before = self.db.read_bytes()
+        with mock.patch.object(module.time, 'time', return_value=self.NOW):
+            capped = module.cap_label(self.con, 'cap-a')
+            self.assertEqual(capped['label'], 'capped builder 2/2 14m')
+            self.assertTrue(capped['alerted'])
+            self.assertIsNone(module.cap_label(self.con, 'run-c'))
+            self.assertIsNone(module.cap_label(self.con, 'plain-e'))
+        self.assertEqual(self.members(module.snapshot(self.db, ['cap-a'], now=self.NOW))['cap-a']['capped'], capped)
+        self.assertEqual(self.db.read_bytes(), before)
 
     def test_later_non_cap_event_clears_capped(self):
         self.cap('cap-b', 20)

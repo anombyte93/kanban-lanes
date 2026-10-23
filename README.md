@@ -141,18 +141,45 @@ kanban-watch.js ──> kanban-watcher rows ──> kanban_live.py (blocks in Py
 
 The scripts read two SQLite databases under `$HERMES_HOME` (default `~/.hermes`), both read-only. The board DB holds each card's status and runs. The assignee profile's session store, `$HERMES_HOME/profiles/<assignee>/state.db`, holds the worker's messages and tool calls, which is where the live stream comes from.
 
-Each card gets up to three rows:
+Your queued cards share a waiting row in each phase. Each started card gets a live row:
 
 | Row | When | What you see |
 |---|---|---|
-| `⏳ waiting` | The card is queued | Nothing until a worker claims it. The row blocks in Python for up to 270 seconds per call. |
+| `⏳ waiting` | Cards in a phase are queued | One `wait-any` call watches that row's fixed set of ids. When any leave the queue, you get their live rows. The rest keep waiting. Each call lasts at most 270 seconds. |
 | Live row | The worker is running | The worker's newest tool calls and its latest message, at most 1.5 KB per call. A last line counts what it left out. With `verbose: true` you get every message and tool result. When the card stops, the row ends with the report: verdict, the model that ran plus any fallback, duration and deliverable. |
-| `⚠` row | The card stops as anything but `DONE` | Shown under **Needs you**, with the reason read from `kanban_live.py snapshot`. This covers `BLOCKED`, `REVIEW`, `ARCHIVED` and `STILL_RUNNING`. If no block reason was recorded, the row says so. |
+| `⚠` row | The card stops as anything but `DONE` | Shown under **Needs you**, with the reason read from `kanban_live.py snapshot`. This covers `BLOCKED`, `REVIEW`, `ARCHIVED`, `STILL_RUNNING` and `NOT_STARTING`. If no block reason was recorded, the row says so. |
 
 Cards a worker files while it runs join the run under **Filed by &lt;card&gt;**, so a run that grows is still one view.
 
+When you watch a dependency graph, a child's live row opens after every watched parent reports
+`DONE`. You do not pay for an idle row in each child stage. Missing or external parents,
+blocked parents and retry histories use ordinary waiters instead. A late arrival gets its own
+waiter at once, even if another waiter in that phase is running or has stopped. A stopped
+waiter is not retried for the same cards.
+
+A card ready for 15 minutes gets a `NOT STARTING` waiting row under **Needs you**. That row
+keeps waiting. A child opened by its parent's report checks `wait-start --ready-stale 900`
+before following. If it is not starting, it returns to a waiter and gets a new live row when
+it starts. The watcher never dispatches it for you.
+
+If you watch a whole board without naming tasks, queued cards whose last non-heartbeat event
+is older than seven days are skipped and logged. Creation time is the fallback when no such
+event exists. Pass `stale_days: 0` to include them, or name the task ids. Explicit ids are
+never age-filtered. You can also set `--stale-days` on `kanban_live.py cards`.
+
+Your snapshots include run-scoped warning counts and a retry flag. Live row labels show
+`run N` after more than one attempt. Known warning counts appear in the result's `odd` field;
+a `DONE` report with warnings also gets a `⚑` log line. Warnings do not turn `DONE` into failure.
+`wait-start` shares `wave_status.py`'s cap labels, such as `capped builder 2/2 14m`. Cap labels
+need dispatcher cap events, which upstream Hermes does not write. A plain `ready` card is
+not proof that no concurrency cap is holding it. A missing or broken optional `wave_status.py`
+turns off cap labels with a note on stderr; other reads still work.
+
 Each watch uses a run-scoped follow cursor. Graph reads cap titles at 120 characters and return
-counts so the workflow can warn if a model drops cards from its reply. A compact follow call
+counts for cards, changed cards and new cards. If validation or deduplication leaves a count
+mismatch, you get one re-read. Both reads are merged, newer facts win, and the earlier start
+time is kept so a child filed between reads is not missed. If the re-read fails, the first
+read is kept. Remaining mismatches name the kept and invalid ids in the log. A compact follow call
 prints `no new worker messages` after 240 seconds without progress, even at the byte cap.
 Heartbeats do not count as progress. Two quiet running calls flag the card as possibly wedged.
 
@@ -164,8 +191,8 @@ Heartbeats do not count as progress. Two quiet running calls flag the card as po
 |---|---|
 | `install.sh` | Copies everything below into `~/.claude`. Supports `--dry-run` and `--uninstall`. |
 | `agents/kanban-watcher.md` | The watcher subagent every row runs as. Its prompt forbids every card action. |
-| `workflows/kanban-watch.js` | The workflow: board plus card ids or phases in, one row per card out. |
-| `scripts/kanban_live.py` | Waits for a card to start, follows it, and snapshots it at the end. |
+| `workflows/kanban-watch.js` | Shared waiting rows, parent-to-child handoffs and a live row per started card. |
+| `scripts/kanban_live.py` | Waits for any named card to start, follows cards, and snapshots their board facts. |
 | `scripts/wave_status.py` | A one-shot or blocking status view of a set of cards. |
 | `scripts/watch_cost.py` | Reads workflow transcripts and reports watcher tokens by run, role and model. |
 | `skills/dynamic-workflow/` | The routing table, the linter and the journal harvester. |
@@ -262,7 +289,9 @@ different models' figures as if they shared a price. The script deduplicates ass
 IDs and counts the last cumulative usage once. Legacy aggregate-only cache writes count as
 5-minute writes. Corrupt watcher transcripts fail visibly instead of returning partial totals.
 
-Your queued rows and the new-card watch use Haiku. Your live rows use Sonnet. All their waits
+Your shared waiting rows and the new-card watch use Haiku. Your live rows use Sonnet, including
+children opened while still queued after a parent report. Fewer idle rows do not establish a
+measured saving: no matched live cost comparison for this handoff is included. All their waits
 use 270 seconds. The new-card watch runs in rounds with up to 13 waits per round, for at most
 `max_hours` + 2 rounds. A new card ends a round early. Pass `follow_new: false` to turn that
 watch off. Your worker's own model use is billed wherever your Hermes profile points.
