@@ -38,30 +38,31 @@ KNOWN = {'triage', 'todo', 'scheduled', 'ready', 'running', 'review', 'blocked',
 QUIESCENT = {'review', 'blocked', 'done', 'archived'}
 
 
-def _capped(con, task_ids, now):
-    """Latest-event cap state for ready members; {} on boards without task_events."""
-    if not task_ids:
-        return {}
+def cap_label(con, task_id, now=None):
+    """Current cap facts and display label, or None. Read-only and legacy-safe.
+
+    Only ready cards whose latest event (apart from capped_alerted) is capped qualify.
+    Wave snapshots and live wait rows use this same rule.
+    """
     columns = {row[1] for row in con.execute('PRAGMA table_info(task_events)')}
     if not {'id', 'task_id', 'kind', 'payload', 'created_at'} <= columns:
-        return {}
-    found = {}
-    for tid in task_ids:
-        events = con.execute(
-            "SELECT kind,payload,created_at FROM task_events WHERE task_id=? "
-            "ORDER BY created_at DESC, id DESC", (tid,)).fetchall()
-        alerted = False
-        for kind, payload, created_at in events:
-            if kind == 'capped_alerted':
-                alerted = True
-                continue
-            if kind == 'capped':
-                found[tid] = _cap_entry(payload, created_at, now, alerted)
-            break
-    return found
-
-
-def _cap_entry(payload, created_at, now, alerted):
+        return None
+    ready = con.execute("SELECT status FROM tasks WHERE id=?", (task_id,)).fetchone()
+    if not ready or ready[0] != 'ready':
+        return None
+    events = con.execute(
+        "SELECT kind,payload,created_at FROM task_events WHERE task_id=? "
+        "ORDER BY created_at DESC, id DESC", (task_id,))
+    alerted = False
+    for kind, payload, created_at in events:
+        if kind == 'capped_alerted':
+            alerted = True
+            continue
+        if kind != 'capped':
+            return None
+        break
+    else:
+        return None
     try:
         data = json.loads(payload) if payload else {}
         if not isinstance(data, dict):
@@ -72,6 +73,7 @@ def _cap_entry(payload, created_at, now, alerted):
     assignee = data.get('assignee') if isinstance(data.get('assignee'), str) else None
     running, cap = data.get('running'), data.get('cap')
     who = scope if scope and scope.startswith('group:') else (assignee or '?')
+    now = time.time() if now is None else now
     minutes = max(0, int((now - created_at) // 60)) if isinstance(created_at, (int, float)) else None
     ratio = f"{'?' if running is None else running}/{'?' if cap is None else cap}"
     return {'scope': scope or 'UNKNOWN', 'assignee': assignee, 'running': running, 'cap': cap,
@@ -129,8 +131,11 @@ def snapshot(database, task_ids, now=None):
         if any(row['status'] not in KNOWN for row in records.values()):
             raise ValueError('Unknown task state: inspect with the owning Kanban tool')
         ready = [tid for tid in task_ids if records[tid]['status'] == 'ready']
-        for tid, capped in _capped(con, ready, time.time() if now is None else now).items():
-            records[tid]['capped'] = capped
+        now = time.time() if now is None else now
+        for tid in ready:
+            capped = cap_label(con, tid, now)
+            if capped:
+                records[tid]['capped'] = capped
     rows = [records[tid] for tid in task_ids]
     counts = dict(sorted(Counter(row['status'] for row in rows).items()))
     capped_count = sum(1 for row in rows if 'capped' in row)

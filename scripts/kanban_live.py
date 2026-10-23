@@ -24,6 +24,10 @@ Subcommands (all read-only; nothing here writes to a board or a session store):
 
   snapshot   --board B --task T [--task T...]        one JSON line per card
   wait-start --board B --task T --max-seconds N      exit 0 once the card left the queue
+             [--ready-stale N]                       exit 6 when ready for N seconds
+  wait-any   --board B --task T [--task T...]        JSON started ids and cards on any queue exit;
+                                                     0 a start (missing ids ride along), 3 timeout,
+                                                     4 missing and no start, 5 unreadable, 6 NOT_STARTING
   follow     --board B --task T --max-seconds N      print new worker messages as they land;
              [--compact | --verbose] [--max-bytes N]  exit 0 once the card is terminal. --compact
                                                      prints tool calls and the latest worker text
@@ -51,13 +55,40 @@ it prints, so a call that is killed first replays its batch on the next call.
 from __future__ import annotations
 
 import argparse
+import contextlib
+import importlib.util
 import json
+import math
 import os
 import re
 import sqlite3
 import sys
 import time
 from pathlib import Path
+
+
+def _no_cap_label(conn, task_id, now=None):
+    return None
+
+
+def _load_cap_label():
+    """A missing, old or broken optional sibling must not break every subcommand."""
+    try:
+        spec = importlib.util.spec_from_file_location(
+            "_kanban_wave_status", Path(__file__).resolve().with_name("wave_status.py"))
+        if spec is None or spec.loader is None:
+            raise ImportError("no loader")
+        module = importlib.util.module_from_spec(spec)
+        # Import diagnostics must never corrupt JSON on stdout.
+        with contextlib.redirect_stdout(sys.stderr):
+            spec.loader.exec_module(module)
+        return module.cap_label
+    except Exception as exc:  # an optional sibling can raise anything at import
+        print(f"kanban_live: cap labels off, wave_status.py not usable ({type(exc).__name__})", file=sys.stderr)
+        return _no_cap_label
+
+
+cap_label = _load_cap_label()
 
 
 _HERMES_HOME_MARKERS = ("config.yaml", ".env", "state.db")
@@ -98,6 +129,8 @@ LEGACY_REASON = "Legacy block reason unknown"
 # Events after which an older `blocked` event no longer describes why the card is blocked.
 BLOCK_RESETS = ("unblocked", "claimed", "gave_up")
 SESSION_SKEW = 10  # seconds a worker session may appear to start before its run (clock skew)
+WARNING_KINDS = ("completion_warnings", "protocol_violation", "suspected_hallucinated_references",
+                 "model_fallback", "timed_out", "crashed", "block_loop_detected")
 
 
 def board_db(board: str) -> Path:
@@ -139,20 +172,22 @@ RUN_FIELDS = ("id", "status", "outcome", "model_used", "provider_used", "fallbac
 MESSAGE_FIELDS = ("id", "role", "content", "tool_calls", "tool_name", "timestamp")
 
 
-def latest_run(conn: sqlite3.Connection, task: str, fields=RUN_FIELDS) -> dict | None:
+def latest_run(conn: sqlite3.Connection, task: str, fields=RUN_FIELDS, run_id=None) -> dict | None:
     """The card's newest task_runs row as a dict (missing columns null); None without runs."""
     if not table_columns(conn, "task_runs"):
         return None
     row = conn.execute(
         f"select {select_list(conn, 'task_runs', fields)} from task_runs"
-        " where task_id = ? order by id desc limit 1",
-        (task,),
+        " where task_id = ? and (? is null or id = ?) order by id desc limit 1",
+        (task, run_id, run_id),
     ).fetchone()
     return dict(row) if row else None
 
 
 def read_card(board: str, task: str) -> dict | None:
     with connect(board_db(board)) as conn:
+        # The run pointer and warning counts must describe the same snapshot.
+        conn.execute("begin")
         row = conn.execute(
             f"select {select_list(conn, 'tasks', TASK_FIELDS)} from tasks where id = ?",
             (task,),
@@ -160,7 +195,8 @@ def read_card(board: str, task: str) -> dict | None:
         if row is None:
             return None
         card = dict(row)
-        card["run"] = latest_run(conn, task)
+        card["run"] = latest_run(conn, task, run_id=card["current_run_id"])
+        card["warnings"] = run_warnings(conn, task, card["run"])
         event = conn.execute(
             "select kind, created_at from task_events where task_id = ?"
             " and kind != 'heartbeat' order by id desc limit 1",
@@ -169,6 +205,23 @@ def read_card(board: str, task: str) -> dict | None:
         card["last_event"] = dict(event) if event else None
         card["block_reason"] = clip_reason(block_reason(conn, task)) if card["status"] == "blocked" else None
     return card
+
+
+def run_warnings(conn: sqlite3.Connection, task: str, run: dict | None) -> dict[str, int]:
+    """Count this run only. Unscoped events use its start; another explicit id never does."""
+    columns = table_columns(conn, "task_events")
+    if not run or not {"task_id", "kind", "created_at"} <= columns:
+        return {}
+    scope = "created_at >= ?"
+    params = [run["started_at"]]
+    if "run_id" in columns:
+        scope = "(run_id = ? or (run_id is null and created_at >= ?))"
+        params = [run["id"], run["started_at"]]
+    return dict(conn.execute(
+        f"select kind, count(*) from task_events where task_id = ? and {scope}"
+        f" and kind in ({','.join('?' * len(WARNING_KINDS))}) group by kind order by kind",
+        (task, *params, *WARNING_KINDS),
+    ).fetchall())
 
 
 def block_reason(conn: sqlite3.Connection, task: str) -> str | None:
@@ -542,15 +595,36 @@ def cmd_snapshot(args) -> int:
     for task in args.task:
         card = read_card(args.board, task)
         if card is None:
-            print(json.dumps({"id": task, "status": "NOT_FOUND"}))
+            print(json.dumps({"id": task, "status": "NOT_FOUND", "retried": False, "warnings": {}}))
             code = 4
         else:
+            with connect(board_db(args.board)) as conn:
+                card["retried"] = was_retried(conn, task)
             print(json.dumps(card, ensure_ascii=False, separators=(",", ":")))
     return code
 
 
+def was_retried(conn: sqlite3.Connection, task: str) -> bool:
+    """Conservative handoff guard, including an unblock before the next run. Legacy-safe."""
+    if table_columns(conn, "task_runs") and conn.execute(
+            "select count(*) from (select 1 from task_runs where task_id = ? limit 2)", (task,)
+    ).fetchone()[0] > 1:
+        return True
+    return bool(conn.execute(
+        "select 1 from task_events where task_id = ?"
+        " and kind in ('blocked', 'unblocked', 'gave_up', 'timed_out', 'crashed', 'changes_requested') limit 1",
+        (task,),
+    ).fetchone()) if {"task_id", "kind"} <= table_columns(conn, "task_events") else False
+
+
 def graph_card(conn: sqlite3.Connection, row: sqlite3.Row) -> dict:
     card = {k: row[k] for k in ("id", "title", "status", "assignee")}
+    card["retried"] = was_retried(conn, row["id"])
+    card["runs"] = conn.execute(
+        "select count(*) from task_runs where task_id = ?", (row["id"],)
+    ).fetchone()[0] if table_columns(conn, "task_runs") else 0
+    if "created_at" in row.keys():
+        card["created_at"] = row["created_at"]
     card["title"] = card["title"][:120]
     card["parents"] = [r[0] for r in conn.execute(
         "select parent_id from task_links where child_id = ? order by parent_id", (row["id"],))
@@ -574,13 +648,13 @@ def board_cards(board: str, tasks: list[str] | None) -> list[dict]:
     with connect(board_db(board)) as conn:
         if tasks:
             rows = conn.execute(
-                f"select id, title, status, assignee from tasks where id in ({','.join('?' * len(tasks))})",
+                f"select id, title, status, assignee, created_at from tasks where id in ({','.join('?' * len(tasks))})",
                 tasks,
             ).fetchall()
         else:
             live = sorted(QUEUED | {"running"})
             rows = conn.execute(
-                f"select id, title, status, assignee from tasks where status in ({','.join('?' * len(live))})"
+                f"select id, title, status, assignee, created_at from tasks where status in ({','.join('?' * len(live))})"
                 " order by created_at",
                 live,
             ).fetchall()
@@ -591,8 +665,49 @@ def cmd_cards(args) -> int:
     cards = board_cards(args.board, args.task)
     found = {c["id"] for c in cards}
     missing = [t for t in (args.task or []) if t not in found]
-    print(json.dumps({"now": int(time.time()), "cards": cards, "count": len(cards), "missing": missing}))
+    now = int(time.time())
+    skipped = []
+    # Explicit ids express intent. Only a bare board watch hides old idle cards, by last change.
+    if not args.task and args.stale_days:
+        with connect(board_db(args.board)) as conn:
+            skipped = [c["id"] for c in cards if c["status"] in QUEUED and c.get("created_at") is not None
+                       and ready_since(conn, c["id"], c["created_at"]) < now - args.stale_days * 86400]
+    skipped_ids = set(skipped)
+    cards = [c for c in cards if c["id"] not in skipped_ids]
+    print(json.dumps({"now": now, "cards": cards, "count": len(cards), "missing": missing,
+                      "stale_skipped": skipped, "stale_days": args.stale_days}))
     return 4 if missing else 0
+
+
+def cmd_wait_any(args) -> int:
+    """One read transaction per poll, no per-card process or cursor. Terminal exits count too."""
+    tasks = list(dict.fromkeys(args.task))
+    deadline = time.monotonic() + args.max_seconds
+    while True:
+        try:
+            with connect(board_db(args.board)) as conn:
+                conn.execute("begin")
+                rows = conn.execute(
+                    f"select id, title, status, assignee, created_at from tasks"
+                    f" where id in ({','.join('?' * len(tasks))})", tasks).fetchall()
+                found = {r["id"] for r in rows}
+                started = [graph_card(conn, r) for r in rows if r["status"] not in QUEUED]
+                idle = [r["id"] for r in rows if r["status"] == "ready" and args.ready_stale
+                        and time.time() - ready_since(conn, r["id"], r["created_at"]) >= args.ready_stale]
+        except sqlite3.Error as exc:
+            print(json.dumps({"error": f"board unreadable: {exc}"}))
+            return 5
+        missing = [t for t in tasks if t not in found]
+        out = {"started": [c["id"] for c in started], "cards": started,
+               "missing": missing, "not_starting": idle}
+        code = 0 if started else 4 if missing else 6 if idle else None
+        if code is None and time.monotonic() >= deadline:
+            out["timeout"] = True
+            code = 3
+        if code is not None:
+            print(json.dumps(out))
+            return code
+        time.sleep(min(args.interval, max(0, deadline - time.monotonic())))
 
 
 def cmd_events(args) -> int:
@@ -616,14 +731,16 @@ def cmd_events(args) -> int:
         # already tracks it, and ending here would spend a caller's round on every start.
         changed = [c for c in current if watch.get(c["id"]) in QUEUED and c["status"] not in QUEUED]
         new = [c for c in fresh if c["creator"] in watch or set(c["parents"]) & set(watch)]
+        out = {"now": int(time.time()), "changed": changed, "new": new,
+               "count_changed": len(changed), "count_new": len(new)}
         if new:
-            print(json.dumps({"now": int(time.time()), "changed": changed, "new": new, "count_new": len(new)}))
+            print(json.dumps(out))
             return 0
         if current and all(c["status"] in TERMINAL for c in current):
-            print(json.dumps({"now": int(time.time()), "changed": changed, "new": [], "count_new": 0, "all_finished": True}))
+            print(json.dumps({**out, "all_finished": True}))
             return 2
         if time.time() >= deadline:
-            print(json.dumps({"now": int(time.time()), "changed": changed, "new": [], "count_new": 0, "timeout": True}))
+            print(json.dumps({**out, "timeout": True}))
             return 3
         nap(deadline, args.interval)
 
@@ -640,6 +757,16 @@ def cmd_active(args) -> int:
     return 0
 
 
+def ready_since(conn: sqlite3.Connection, task: str, created_at: int | None) -> int:
+    """Last non-heartbeat event; creation is the fallback on older boards."""
+    if not {"task_id", "kind", "created_at"} <= table_columns(conn, "task_events"):
+        return int(created_at or 0)
+    row = conn.execute(
+        "select max(created_at) from task_events where task_id = ? and kind != 'heartbeat'", (task,),
+    ).fetchone()
+    return int((row[0] if row and row[0] else created_at) or 0)
+
+
 def cmd_wait_start(args) -> int:
     deadline = time.time() + args.max_seconds
     last = None
@@ -648,11 +775,26 @@ def cmd_wait_start(args) -> int:
         if card is None:
             print(f"{args.task}: NOT_FOUND on board {args.board}")
             return 4
-        if card["status"] != last:
-            print(card_line(card), flush=True)
-            last = card["status"]
+        capped = None
+        if card["status"] == "ready":
+            with connect(board_db(args.board)) as conn:
+                capped = cap_label(conn, args.task)
+        label = capped["label"] if capped else ""
+        state = (card["status"], capped and (capped["scope"], capped["assignee"], capped["running"],
+                                            capped["cap"], capped["alerted"]))
+        if state != last:
+            print(card_line(card) + (f" | {label}" if label else ""), flush=True)
+            last = state
         if card["status"] not in QUEUED:
             return 0
+        if card["status"] == "ready" and args.ready_stale:
+            with connect(board_db(args.board)) as conn:
+                since = ready_since(conn, args.task, card["created_at"])
+            if time.time() - since >= args.ready_stale:
+                print(f"NOT STARTING: {args.task} has been ready {int((time.time() - since) // 60)} min"
+                      " and no dispatcher took it", flush=True)
+                print("status NOT_STARTING", flush=True)
+                return 6
         if time.time() >= deadline:
             print(f"still {card['status']} - call again", flush=True)
             return 3
@@ -802,6 +944,8 @@ def main(argv=None) -> int:
     p = sub.add_parser("cards")
     p.add_argument("--board", default="default")
     p.add_argument("--task", action="append")
+    p.add_argument("--stale-days", type=float, default=7,
+                   help="skip older queued cards on unscoped watches; 0 disables (explicit ids always kept)")
     p = sub.add_parser("events")
     common(p)
     p.add_argument("--watch", required=True, help="id=status,id=status as last seen")
@@ -812,6 +956,12 @@ def main(argv=None) -> int:
     p = sub.add_parser("wait-start")
     common(p)
     p.add_argument("--task", required=True)
+    p.add_argument("--ready-stale", type=int, default=0,
+                   help="exit 6 once ready this many seconds (0 = never)")
+    p = sub.add_parser("wait-any")
+    common(p, many=True)
+    p.add_argument("--ready-stale", type=int, default=0,
+                   help="exit 6 with not_starting ids after this ready idle time; 0 disables")
     p = sub.add_parser("follow")
     common(p)
     p.add_argument("--task", required=True)
@@ -830,13 +980,17 @@ def main(argv=None) -> int:
     p.add_argument("--since", type=int, required=True)
 
     args = parser.parse_args(argv)
+    if args.cmd == "cards" and (not math.isfinite(args.stale_days) or args.stale_days < 0):
+        parser.error("--stale-days must be finite and non-negative")
+    if args.cmd == "wait-any" and (not 0 <= args.max_seconds <= 270 or args.interval <= 0 or args.ready_stale < 0):
+        parser.error("wait-any requires 0 <= --max-seconds <= 270, --interval > 0 and --ready-stale >= 0")
     if args.cmd == "follow" and args.max_bytes is not None and args.max_bytes < 128:
         parser.error("--max-bytes must be at least 128 to fit the status and overflow count")
     if not board_db(args.board).exists():
         print(f"board {args.board} has no kanban.db at {board_db(args.board)}")
         return 5
     return {"snapshot": cmd_snapshot, "cards": cmd_cards, "events": cmd_events, "active": cmd_active, "wait-start": cmd_wait_start,
-            "follow": cmd_follow, "scout": cmd_scout}[args.cmd](args)
+            "wait-any": cmd_wait_any, "follow": cmd_follow, "scout": cmd_scout}[args.cmd](args)
 
 
 if __name__ == "__main__":
